@@ -1,51 +1,50 @@
 'use client';
 
-import React, { useRef, useEffect, useState, useCallback } from 'react';
-import maplibregl, { Map as MaplibreMap, MercatorCoordinate } from 'maplibre-gl';
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import maplibregl, { Map as MaplibreMap } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { MapboxOverlay } from '@deck.gl/mapbox';
 import { Tile3DLayer } from '@deck.gl/geo-layers';
-import { SimpleMeshLayer } from '@deck.gl/mesh-layers';
 import { Tiles3DLoader } from '@loaders.gl/3d-tiles';
-import { OBJLoader as OBJLoaderGL } from '@loaders.gl/obj';
+import { Feature } from 'geojson';
 
 import LoadingIndicator from './LoadingIndicator';
-import UIControls, { ViewMode } from './UIControls';
+import LeftPanel, { ViewMode } from './panels/LeftPanel';
+import FeatureDetailPanel from './panels/FeatureDetailPanel';
+import DataTableDrawer from './panels/DataTableDrawer';
+import { useShapefileLayers, LayerState } from './gis/useShapefileLayers';
+import { SHAPEFILE_LAYERS } from './gis/layerRegistry';
 import { MAKASSAR_CENTER } from '../utils/geoUtils';
 import styles from './MapViewer.module.css';
 
 // Initial map view settings for Makassar
 const INITIAL_VIEW = {
     center: [MAKASSAR_CENTER.lng, MAKASSAR_CENTER.lat] as [number, number],
-    zoom: 17,
-    pitch: 60,
-    bearing: -20,
+    zoom: 16,
+    pitch: 45,
+    bearing: 0,
 };
 
-// Model center location (where the 3D model should be placed)
-const MODEL_CENTER = {
-    lng: MAKASSAR_CENTER.lng,
-    lat: MAKASSAR_CENTER.lat,
-    altitude: 0,
-};
-
-/**
- * Main component that integrates MapLibre GL JS with deck.gl for 3D Tiles
- * and Three.js for OBJ model rendering
- */
 export default function MapViewer() {
     const mapContainerRef = useRef<HTMLDivElement>(null);
     const mapRef = useRef<MaplibreMap | null>(null);
     const deckOverlayRef = useRef<MapboxOverlay | null>(null);
 
-
+    // App State
+    const [viewMode, setViewMode] = useState<ViewMode>('3d');
+    const [enable3DTiles, setEnable3DTiles] = useState(true);
     const [isLoading, setIsLoading] = useState(true);
     const [loadingProgress, setLoadingProgress] = useState(0);
     const [loadingMessage, setLoadingMessage] = useState('Initializing map...');
-    const [viewMode, setViewMode] = useState<ViewMode>('tiles');
     const [lightIntensity, setLightIntensity] = useState(1);
 
-    // Reset view to initial position
+    // GIS State
+    const { layers, toggleLayer, setLayerOpacity } = useShapefileLayers();
+    const [activeLayerId, setActiveLayerId] = useState<string | null>(null);
+    const [selectedFeature, setSelectedFeature] = useState<Feature | null>(null);
+    const [isDataTableOpen, setIsDataTableOpen] = useState(false);
+
+    // Reset view
     const handleResetView = useCallback(() => {
         if (mapRef.current) {
             mapRef.current.flyTo({
@@ -58,77 +57,10 @@ export default function MapViewer() {
         }
     }, []);
 
-    // Update lighting intensity
-    const handleLightIntensityChange = useCallback((intensity: number) => {
-        setLightIntensity(intensity);
-        // Note: Lighting for deck.gl ScenegraphLayer is handled via _lighting prop or LightingEffect
-    }, []);
-
-    // Toggle between 3D Tiles and OBJ view
-    const handleViewModeChange = useCallback((mode: ViewMode) => {
-        setViewMode(mode);
-
-        if (deckOverlayRef.current) {
-            const layers = [];
-
-            if (mode === 'tiles') {
-                const tile3DLayer = new Tile3DLayer({
-                    id: 'tile-3d-layer',
-                    data: `${window.location.origin}/terra_b3dms/tileset.json`,
-                    loader: Tiles3DLoader,
-                    loadOptions: {
-                        tileset: {
-                            maximumScreenSpaceError: 1,
-                        },
-                    },
-                    onTilesetLoad: () => {
-                        setLoadingProgress(100);
-                        setLoadingMessage('3D Tiles loaded!');
-                    },
-                    pointSize: 2,
-                    opacity: 1,
-                });
-                layers.push(tile3DLayer);
-            } else if (mode === 'obj') {
-                const simpleMeshLayer = new SimpleMeshLayer({
-                    id: 'obj-layer',
-                    data: [
-                        {
-                            position: [MODEL_CENTER.lng, MODEL_CENTER.lat],
-                            size: 1,
-                            angle: 0,
-                        },
-                    ],
-                    getPosition: (d: any) => d.position,
-                    getOrientation: [0, 0, 0],
-                    sizeScale: 1,
-                    mesh: `${window.location.origin}/terra_obj/Block0/Block0.obj`,
-                    loaders: [OBJLoaderGL],
-                    texture: `${window.location.origin}/terra_obj/Block0/Block0_0_0.jpg`,
-                    _lighting: 'pbr',
-                    onDataLoad: () => {
-                        setLoadingProgress(100);
-                        setLoadingMessage('OBJ Model Loaded');
-                    }
-                });
-                layers.push(simpleMeshLayer);
-            }
-
-            deckOverlayRef.current.setProps({ layers });
-        }
-
-        if (mapRef.current) {
-            mapRef.current.triggerRepaint();
-        }
-    }, []);
-
-    // Initialize map
+    // Initial Map Setup
     useEffect(() => {
         if (!mapContainerRef.current) return;
 
-
-
-        // Create MapLibre map
         const map = new maplibregl.Map({
             container: mapContainerRef.current,
             style: {
@@ -143,23 +75,21 @@ export default function MapViewer() {
                         ],
                         tileSize: 256,
                         attribution: '© OpenStreetMap contributors',
-                        maxzoom: 19, // Server limit
+                        maxzoom: 19,
                     },
                 },
                 layers: [
                     {
                         id: 'background',
                         type: 'background',
-                        paint: {
-                            'background-color': '#f0f0f0',
-                        },
+                        paint: { 'background-color': '#f0f0f0' },
                     },
                     {
                         id: 'osm',
                         type: 'raster',
                         source: 'osm',
                         minzoom: 0,
-                        maxzoom: 24, // Allow overzoom beyond 19
+                        maxzoom: 24,
                     },
                 ],
             },
@@ -172,45 +102,53 @@ export default function MapViewer() {
         mapRef.current = map;
 
         map.on('load', () => {
-            setLoadingMessage('Setting up 3D renderer...');
-            setLoadingProgress(20);
-
-            // Create deck.gl overlay for 3D Tiles
-            const tile3DLayer = new Tile3DLayer({
-                id: 'tile-3d-layer',
-                data: `${window.location.origin}/terra_b3dms/tileset.json`,
-                loader: Tiles3DLoader,
-                loadOptions: {
-                    tileset: {
-                        maximumScreenSpaceError: 1,
-                    },
-                },
-                onTilesetLoad: (tileset) => {
-                    console.log('Tileset loaded:', tileset);
-                    console.log('Tileset cartographicCenter:', tileset.cartographicCenter);
-                    console.log('Tileset boundingVolume:', tileset.boundingVolume);
-
-                    setLoadingProgress(100);
-                    setLoadingMessage('3D Tiles loaded!');
-                    setTimeout(() => setIsLoading(false), 500);
-                },
-                onTileLoad: (tile) => {
-                    console.log('Tile loaded:', tile.id);
-                },
-                onTileError: (tile, url, error) => {
-                    console.error('Tile error:', url, error);
-                },
-                pointSize: 2,
-                opacity: 1,
-            });
-
+            // Initialize DeckGL overlay for 3D Tiles
             const deckOverlay = new MapboxOverlay({
                 interleaved: true,
-                layers: [tile3DLayer],
+                layers: [], // Initially empty, controlled by effect
             });
-
             map.addControl(deckOverlay as unknown as maplibregl.IControl);
             deckOverlayRef.current = deckOverlay;
+
+            setIsLoading(false);
+            setLoadingMessage('');
+        });
+
+        // Map Click Handler for Features
+        map.on('click', (e) => {
+            // Only query if in shapefile mode or if we want to allow picking in 3D mode too?
+            // Assuming simplified experience: picking works for visible vector layers.
+            const visibleLayerIds = SHAPEFILE_LAYERS
+                .map(l => l.id)
+                .filter(id => map.getLayer(id)); // only if layer exists on map
+
+            if (visibleLayerIds.length === 0) {
+                setSelectedFeature(null);
+                return;
+            }
+
+            const features = map.queryRenderedFeatures(e.point, { layers: visibleLayerIds });
+            if (features.length > 0) {
+                const feature = features[0];
+                setSelectedFeature(feature);
+                // Also set active layer to the one selected for context
+                const layerId = feature.layer.id;
+                setActiveLayerId(layerId);
+            } else {
+                setSelectedFeature(null);
+            }
+        });
+
+        // Add cursor pointer for features
+        map.on('mousemove', (e) => {
+            const visibleLayerIds = SHAPEFILE_LAYERS
+                .map(l => l.id)
+                .filter(id => map.getLayer(id));
+
+            if (visibleLayerIds.length > 0) {
+                const features = map.queryRenderedFeatures(e.point, { layers: visibleLayerIds });
+                map.getCanvas().style.cursor = features.length ? 'pointer' : '';
+            }
         });
 
         map.addControl(new maplibregl.NavigationControl(), 'top-right');
@@ -223,23 +161,207 @@ export default function MapViewer() {
         };
     }, []);
 
+    // Manage 3D Tiles Logic
+    useEffect(() => {
+        if (!deckOverlayRef.current) return;
+
+        const layers = [];
+        if (enable3DTiles) {
+            const tile3DLayer = new Tile3DLayer({
+                id: 'tile-3d-layer',
+                data: `${window.location.origin}/terra_b3dms/tileset.json`,
+                loader: Tiles3DLoader,
+                loadOptions: {
+                    tileset: {
+                        maximumScreenSpaceError: 1,
+                    },
+                },
+                onTilesetLoad: () => {
+                    // Only show loading if we are just enabling it or starting up
+                    if (loadingProgress < 100) {
+                        setLoadingProgress(100);
+                        setLoadingMessage('3D Tiles loaded');
+                        setTimeout(() => setLoadingMessage(''), 2000);
+                    }
+                },
+                pointSize: 2,
+                opacity: 1,
+            });
+            layers.push(tile3DLayer);
+        }
+
+        deckOverlayRef.current.setProps({ layers });
+    }, [enable3DTiles]); // Re-run when toggle changes
+
+    // Manage Shapefile Layers on MapLibre
+    useEffect(() => {
+        const map = mapRef.current;
+        if (!map || !map.isStyleLoaded()) return;
+
+        Object.values(layers).forEach((layerState: LayerState) => {
+            const { config, visible, loaded, data, opacity } = layerState;
+            const sourceId = `source-${config.id}`;
+            const layerId = config.id;
+
+            // 1. Add Source if loaded and missing
+            if (loaded && data && !map.getSource(sourceId)) {
+                map.addSource(sourceId, {
+                    type: 'geojson',
+                    data: data.featureCollection,
+                });
+            }
+
+            // 2. Add/Update Layer
+            const layerExists = !!map.getLayer(layerId);
+
+            if (visible && loaded && data) {
+                if (!layerExists) {
+                    // Add Layer
+                    if (config.geometryType === 'polygon') {
+                        map.addLayer({
+                            id: layerId,
+                            type: 'fill',
+                            source: sourceId,
+                            paint: {
+                                'fill-color': `rgba(${config.color[0]}, ${config.color[1]}, ${config.color[2]}, 1)`,
+                                'fill-opacity': opacity,
+                                'fill-outline-color': '#ffffff'
+                            },
+                        });
+                        // Add Outline layer for better visibility
+                        map.addLayer({
+                            id: `${layerId}-outline`,
+                            type: 'line',
+                            source: sourceId,
+                            paint: {
+                                'line-color': '#ffffff',
+                                'line-width': 1,
+                                'line-opacity': opacity
+                            },
+                        });
+                    } else if (config.geometryType === 'line') {
+                        map.addLayer({
+                            id: layerId,
+                            type: 'line',
+                            source: sourceId,
+                            paint: {
+                                'line-color': `rgba(${config.color[0]}, ${config.color[1]}, ${config.color[2]}, 1)`,
+                                'line-width': 2,
+                                'line-opacity': opacity,
+                            },
+                        });
+                    }
+
+                    // Zoom to layer if it was just loaded/enabled (Optional UX improvement)
+                    if (data.bbox) {
+                        const [minLng, minLat, maxLng, maxLat] = data.bbox;
+                        // Basic check to ensure valid bbox
+                        if (minLng !== 180 && maxLng !== -180) {
+                            // Only fit bounds if we haven't done it yet for this layer session
+                            // But doing it every time it becomes visible might be annoying. 
+                            // Let's rely on user "Zoom to Layer" action instead, 
+                            // or just do nothing here to keep view stable.
+                        }
+                    }
+
+                } else {
+                    // Update Paint Properties
+                    if (config.geometryType === 'polygon') {
+                        map.setPaintProperty(layerId, 'fill-opacity', opacity);
+                        if (map.getLayer(`${layerId}-outline`)) {
+                            map.setPaintProperty(`${layerId}-outline`, 'line-opacity', opacity);
+                        }
+                    } else if (config.geometryType === 'line') {
+                        map.setPaintProperty(layerId, 'line-opacity', opacity);
+                    }
+                }
+            } else if (!visible && layerExists) {
+                map.removeLayer(layerId);
+                if (map.getLayer(`${layerId}-outline`)) map.removeLayer(`${layerId}-outline`);
+            }
+        });
+    }, [layers]); // re-run when layer state changes
+
+    const activeLayerFeatures = useMemo(() => {
+        if (!activeLayerId || !layers[activeLayerId]?.data) return [];
+        return layers[activeLayerId].data!.featureCollection.features;
+    }, [activeLayerId, layers]);
+
+    const handleZoomToFeature = (feature: Feature) => {
+        if (!mapRef.current) return;
+
+        // If feature has bbox (GeoJSON spec optional), use it
+        if (feature.bbox) {
+            mapRef.current.fitBounds(feature.bbox as [number, number, number, number], { padding: 50 });
+            return;
+        }
+
+        // Fallback: Compute simplified bbox similar to loader or just fly to first coord
+        // Use a simple centroid strategy for MVP
+        let center: [number, number] | null = null;
+
+        if (feature.geometry.type === 'Point') {
+            center = feature.geometry.coordinates as [number, number];
+        } else if (feature.geometry.type === 'Polygon') {
+            center = feature.geometry.coordinates[0][0] as [number, number];
+        } else if (feature.geometry.type === 'MultiPolygon') {
+            center = feature.geometry.coordinates[0][0][0] as [number, number];
+        } else if (feature.geometry.type === 'LineString') {
+            center = feature.geometry.coordinates[0] as [number, number];
+        }
+
+        if (center) {
+            mapRef.current.flyTo({ center, zoom: 18 });
+        }
+    };
+
+    const handleRowClick = (feature: Feature) => {
+        setSelectedFeature(feature);
+        handleZoomToFeature(feature);
+    };
+
     return (
         <div className={styles.container}>
             <div ref={mapContainerRef} className={styles.map} />
 
             <LoadingIndicator
-                isLoading={isLoading}
+                isLoading={isLoading || Object.values(layers).some(l => l.loading)}
                 progress={loadingProgress}
-                message={loadingMessage}
+                message={
+                    Object.values(layers).find(l => l.loading)
+                        ? `Loading ${Object.values(layers).find(l => l.loading)?.config.name}...`
+                        : loadingMessage
+                }
             />
 
-            <UIControls
+            <LeftPanel
                 viewMode={viewMode}
-                onViewModeChange={handleViewModeChange}
+                onViewModeChange={setViewMode}
+                enable3DTiles={enable3DTiles}
+                onEnable3DTilesChange={setEnable3DTiles}
+                layers={layers}
+                onToggleLayer={toggleLayer}
+                onLayerOpacityChange={setLayerOpacity}
+                activeLayerId={activeLayerId}
+                onSetActiveLayer={setActiveLayerId}
+                onOpenDataTable={() => setIsDataTableOpen(true)}
                 onResetView={handleResetView}
                 lightIntensity={lightIntensity}
-                onLightIntensityChange={handleLightIntensityChange}
-                isLoading={isLoading}
+                onLightIntensityChange={setLightIntensity}
+            />
+
+            <FeatureDetailPanel
+                feature={selectedFeature}
+                onClose={() => setSelectedFeature(null)}
+                onZoomToFeature={handleZoomToFeature}
+            />
+
+            <DataTableDrawer
+                isOpen={isDataTableOpen}
+                onClose={() => setIsDataTableOpen(false)}
+                activeLayerId={activeLayerId}
+                features={activeLayerFeatures}
+                onRowClick={handleRowClick}
             />
         </div>
     );

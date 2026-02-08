@@ -24,6 +24,7 @@
     "proj4": "^2.20.2",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "shapefile": "^0.6.6",
     "three": "^0.182.0"
   },
   "devDependencies": {
@@ -31,6 +32,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/shapefile": "^0.6.4",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
