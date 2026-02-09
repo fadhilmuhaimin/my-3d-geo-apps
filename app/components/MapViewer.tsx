@@ -250,20 +250,20 @@ export default function MapViewer() {
                                 'line-opacity': opacity,
                             },
                         });
+                    } else if (config.geometryType === 'point') {
+                        map.addLayer({
+                            id: layerId,
+                            type: 'circle',
+                            source: sourceId,
+                            paint: {
+                                'circle-color': `rgba(${config.color[0]}, ${config.color[1]}, ${config.color[2]}, 1)`,
+                                'circle-radius': 5,
+                                'circle-opacity': opacity,
+                                'circle-stroke-width': 1,
+                                'circle-stroke-color': '#ffffff'
+                            },
+                        });
                     }
-
-                    // Zoom to layer if it was just loaded/enabled (Optional UX improvement)
-                    if (data.bbox) {
-                        const [minLng, minLat, maxLng, maxLat] = data.bbox;
-                        // Basic check to ensure valid bbox
-                        if (minLng !== 180 && maxLng !== -180) {
-                            // Only fit bounds if we haven't done it yet for this layer session
-                            // But doing it every time it becomes visible might be annoying. 
-                            // Let's rely on user "Zoom to Layer" action instead, 
-                            // or just do nothing here to keep view stable.
-                        }
-                    }
-
                 } else {
                     // Update Paint Properties
                     if (config.geometryType === 'polygon') {
@@ -273,6 +273,9 @@ export default function MapViewer() {
                         }
                     } else if (config.geometryType === 'line') {
                         map.setPaintProperty(layerId, 'line-opacity', opacity);
+                    } else if (config.geometryType === 'point') {
+                        map.setPaintProperty(layerId, 'circle-opacity', opacity);
+                        map.setPaintProperty(layerId, 'circle-stroke-opacity', opacity);
                     }
                 }
             } else if (!visible && layerExists) {

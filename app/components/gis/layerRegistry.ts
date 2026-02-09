@@ -7,12 +7,13 @@ export interface ShapefileLayerConfig {
     defaultVisible: boolean;
     defaultOpacity: number;
     color: [number, number, number, number]; // [r, g, b, a]
+    sourceProjection?: string; // Optional Proj4 string
 }
 
 export const SHAPEFILE_LAYERS: ShapefileLayerConfig[] = [
     {
         id: 'delineasi',
-        name: 'Delineasi',
+        name: 'Batas Kota (Outline)', // Renamed for clarity
         folder: '/data/shp/delineasi',
         basename: 'Delineasi',
         geometryType: 'polygon',
@@ -22,21 +23,21 @@ export const SHAPEFILE_LAYERS: ShapefileLayerConfig[] = [
     },
     {
         id: 'pola-ruang-makassar',
-        name: 'Pola Ruang Makassar',
+        name: 'Pola Ruang (DATA UTAMA)', // Renamed for clarity
         folder: '/data/shp/pola-ruang-makassar',
         basename: 'Pola Ruang Makassar',
         geometryType: 'polygon',
-        defaultVisible: false,
+        defaultVisible: true, // Enable by default for demo
         defaultOpacity: 0.6,
         color: [0, 255, 0, 150],
     },
     {
         id: 'sistem-jaringan-jalan',
-        name: 'Sistem Jaringan Jalan',
+        name: 'Sistem Jaringan (Points)',
         folder: '/data/shp/sistem-jaringan-jalan',
         basename: 'Sistem Jaringan Jalan',
-        geometryType: 'line',
-        defaultVisible: false,
+        geometryType: 'point',
+        defaultVisible: true, // Enable by default
         defaultOpacity: 1.0,
         color: [0, 0, 255, 255],
     },

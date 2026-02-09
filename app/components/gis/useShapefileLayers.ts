@@ -59,7 +59,7 @@ export function useShapefileLayers() {
         if (!layerConfig) return;
 
         try {
-            const data = await loadShapefile(layerConfig.folder, layerConfig.basename);
+            const data = await loadShapefile(layerConfig.folder, layerConfig.basename, layerConfig.sourceProjection);
 
             setLayers(prev => ({
                 ...prev,

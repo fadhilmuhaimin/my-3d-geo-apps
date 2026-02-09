@@ -1,5 +1,6 @@
 import * as shapefile from 'shapefile';
-import type { FeatureCollection, Geometry, GeoJsonProperties } from 'geojson';
+import type { FeatureCollection, Geometry, Position } from 'geojson';
+import proj4 from 'proj4';
 
 export interface LoadedShapefile {
     featureCollection: FeatureCollection;
@@ -7,9 +8,14 @@ export interface LoadedShapefile {
     fields: string[];
 }
 
-export async function loadShapefile(folder: string, basename: string): Promise<LoadedShapefile> {
-    const shpUrl = `${folder}/${basename}.shp`;
-    const dbfUrl = `${folder}/${basename}.dbf`;
+export async function loadShapefile(folder: string, basename: string, sourceProjection?: string): Promise<LoadedShapefile> {
+    // Ensure properly encoded URLs to handle spaces and special chars
+    const encodedFolder = folder.split('/').map(encodeURIComponent).join('/'); // carefully encode path segments if needed, but here usually folder is safe path.
+    // Actually, folder path usually starts with / so split might create empty first element.
+    // Safer:
+    const safeBasename = encodeURIComponent(basename);
+    const shpUrl = `${folder}/${safeBasename}.shp`;
+    const dbfUrl = `${folder}/${safeBasename}.dbf`;
 
     try {
         const [shpRes, dbfRes] = await Promise.all([
@@ -27,14 +33,21 @@ export async function loadShapefile(folder: string, basename: string): Promise<L
         // Parse shapefile
         const geojson = await shapefile.read(shpBuffer, dbfBuffer) as FeatureCollection;
 
+        // Reproject if sourceProjection is provided
+        if (sourceProjection) {
+            geojson.features.forEach(feature => {
+                if (feature.geometry) {
+                    reprojectGeometry(feature.geometry, sourceProjection);
+                }
+            });
+        }
+
         // Calculate bbox and fields
         let minLng = 180, minLat = 90, maxLng = -180, maxLat = -90;
         const fields = new Set<string>();
 
         geojson.features.forEach(feature => {
-            // BBox calculation (simplified for points/lines/polygons)
-            // Note: A more robust implementation would use a library like @turf/bbox, 
-            // but we'll do a simple coordinate scan here to avoid extra heavy deps if not needed.
+            // BBox calculation
             if (feature.geometry) {
                 updateBBox(feature.geometry, (lng, lat) => {
                     if (lng < minLng) minLng = lng;
@@ -50,6 +63,11 @@ export async function loadShapefile(folder: string, basename: string): Promise<L
             }
         });
 
+        // Handle case where no geometry exists
+        if (minLng > maxLng) {
+            minLng = 0; maxLng = 0; minLat = 0; maxLat = 0;
+        }
+
         return {
             featureCollection: geojson,
             bbox: [minLng, minLat, maxLng, maxLat],
@@ -58,6 +76,25 @@ export async function loadShapefile(folder: string, basename: string): Promise<L
     } catch (err) {
         console.error(`Error loading shapefile ${basename}:`, err);
         throw err;
+    }
+}
+
+function reprojectGeometry(geometry: Geometry, sourceProjection: string) {
+    const transform = (coords: Position): Position => {
+        // proj4(from, to, coords)
+        const [x, y] = coords;
+        const [lng, lat] = proj4(sourceProjection, 'EPSG:4326', [x, y]);
+        return [lng, lat];
+    };
+
+    if (geometry.type === 'Point') {
+        geometry.coordinates = transform(geometry.coordinates);
+    } else if (geometry.type === 'LineString' || geometry.type === 'MultiPoint') {
+        geometry.coordinates = geometry.coordinates.map(transform);
+    } else if (geometry.type === 'Polygon' || geometry.type === 'MultiLineString') {
+        geometry.coordinates = geometry.coordinates.map(ring => ring.map(transform));
+    } else if (geometry.type === 'MultiPolygon') {
+        geometry.coordinates = geometry.coordinates.map(poly => poly.map(ring => ring.map(transform)));
     }
 }
 
