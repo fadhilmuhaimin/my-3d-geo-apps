@@ -6,6 +6,9 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import { MapboxOverlay } from '@deck.gl/mapbox';
 import { Tile3DLayer } from '@deck.gl/geo-layers';
 import { Tiles3DLoader } from '@loaders.gl/3d-tiles';
+import { DracoLoader } from '@loaders.gl/draco';
+import { applyAnisotropyToTile } from '../utils/anisotropy';
+import { DEVICE_PROFILES, getDeviceProfile } from '../utils/deviceProfile';
 import { Feature } from 'geojson';
 
 import LoadingIndicator from './LoadingIndicator';
@@ -161,7 +164,44 @@ export default function MapViewer() {
         };
     }, []);
 
+    // Mobile/Desktop tuning
+    const deviceProfile = useMemo(() => DEVICE_PROFILES[getDeviceProfile()], []);
+
     // Manage 3D Tiles Logic
+    const loadOptions = useMemo(() => ({
+        tileset: {
+            maximumScreenSpaceError: 0.75,   // lebih kecil = lebih detail
+            viewDistanceScale: 0.25,         // lebih kecil = terasa lebih dekat
+            geometricErrorMultiplier: 50,    // NAIKKAN besar (ini yang sering jadi kunci)
+            refinementStrategy: 'best-available',
+
+            // percepat refine
+            throttleRequests: false,         // MATIKAN dulu untuk test
+            maxRequests: 48,                 // naikin biar child tiles keburu masuk
+            debounceTime: 0,
+
+            maximumMemoryUsage: 3072,        // kalau desktop sanggup
+            updateTransforms: false,
+        },
+        draco: { decoderType: 'js' },
+    }), []);
+
+    const subLayerProps = useMemo(() => ({
+        scenegraph: {
+            _lighting: 'flat', // Unlit mode for baked textures
+            textureParameters: {
+                // GL.TEXTURE_MIN_FILTER: GL.LINEAR_MIPMAP_LINEAR
+                10241: 9987,
+                // GL.TEXTURE_MAG_FILTER: GL.LINEAR
+                10240: 9729,
+                // GL.TEXTURE_WRAP_S: GL.CLAMP_TO_EDGE
+                10242: 33071,
+                // GL.TEXTURE_WRAP_T: GL.CLAMP_TO_EDGE
+                10243: 33071,
+            },
+        },
+    }), []);
+
     useEffect(() => {
         if (!deckOverlayRef.current) return;
 
@@ -170,11 +210,22 @@ export default function MapViewer() {
             const tile3DLayer = new Tile3DLayer({
                 id: 'tile-3d-layer',
                 data: `${window.location.origin}/terra_b3dms/tileset.json`,
-                loader: Tiles3DLoader,
-                loadOptions: {
-                    tileset: {
-                        maximumScreenSpaceError: 1,
-                    },
+                loaders: [Tiles3DLoader, DracoLoader],
+                loadOptions: loadOptions,
+                _subLayerProps: subLayerProps,
+                onTileLoad: (tileHeader) => {
+                    const content = tileHeader.content;
+                    if (content && deckOverlayRef.current) {
+                        const deck = (deckOverlayRef.current as any)._deck;
+                        if (deck && deck.gl) {
+                            applyAnisotropyToTile(content, deck.gl, deviceProfile.anisotropyLevel);
+                        }
+                    }
+                    // Progressive loading feedback
+                    setLoadingMessage(prev => {
+                        const count = parseInt(prev.match(/\d+/)?.[0] || '0') + 1;
+                        return `Loading 3D Tiles... (${count})`;
+                    });
                 },
                 onTilesetLoad: () => {
                     // Only show loading if we are just enabling it or starting up
@@ -191,7 +242,7 @@ export default function MapViewer() {
         }
 
         deckOverlayRef.current.setProps({ layers });
-    }, [enable3DTiles]); // Re-run when toggle changes
+    }, [enable3DTiles, loadOptions, subLayerProps, loadingProgress, deviceProfile]); // Re-run when toggle changes
 
     // Manage Shapefile Layers on MapLibre
     useEffect(() => {
