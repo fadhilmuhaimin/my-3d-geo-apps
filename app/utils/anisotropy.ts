@@ -1,4 +1,8 @@
-export function applyAnisotropyToTile(content: any, gl: WebGL2RenderingContext, maxAnisotropyCap: number = 16) {
+export function applyAnisotropyToTile(
+    content: any,
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    maxAnisotropyCap: number = 16
+) {
     if (!content || !content.gltf || !content.gltf.textures) return;
 
     const ext = gl.getExtension('EXT_texture_filter_anisotropic');

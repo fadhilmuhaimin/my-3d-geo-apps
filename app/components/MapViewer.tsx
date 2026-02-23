@@ -3,12 +3,6 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import maplibregl, { Map as MaplibreMap } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { MapboxOverlay } from '@deck.gl/mapbox';
-import { Tile3DLayer } from '@deck.gl/geo-layers';
-import { Tiles3DLoader } from '@loaders.gl/3d-tiles';
-import { DracoLoader } from '@loaders.gl/draco';
-import { applyAnisotropyToTile } from '../utils/anisotropy';
-import { DEVICE_PROFILES, getDeviceProfile } from '../utils/deviceProfile';
 import { Feature } from 'geojson';
 
 import LoadingIndicator from './LoadingIndicator';
@@ -18,6 +12,7 @@ import DataTableDrawer from './panels/DataTableDrawer';
 import { useShapefileLayers, LayerState } from './gis/useShapefileLayers';
 import { SHAPEFILE_LAYERS } from './gis/layerRegistry';
 import { MAKASSAR_CENTER } from '../utils/geoUtils';
+import { ThreeDTilesLayer } from '../utils/threeDTilesLayer';
 import styles from './MapViewer.module.css';
 
 // Initial map view settings for Makassar
@@ -28,16 +23,17 @@ const INITIAL_VIEW = {
     bearing: 0,
 };
 
+const TILES_LAYER_ID = 'three-d-tiles-layer';
+
 export default function MapViewer() {
     const mapContainerRef = useRef<HTMLDivElement>(null);
     const mapRef = useRef<MaplibreMap | null>(null);
-    const deckOverlayRef = useRef<MapboxOverlay | null>(null);
+    const tilesLayerRef = useRef<ThreeDTilesLayer | null>(null);
 
     // App State
     const [viewMode, setViewMode] = useState<ViewMode>('3d');
     const [enable3DTiles, setEnable3DTiles] = useState(true);
     const [isLoading, setIsLoading] = useState(true);
-    const [loadingProgress, setLoadingProgress] = useState(0);
     const [loadingMessage, setLoadingMessage] = useState('Initializing map...');
     const [lightIntensity, setLightIntensity] = useState(1);
 
@@ -60,7 +56,7 @@ export default function MapViewer() {
         }
     }, []);
 
-    // Initial Map Setup
+    // ── Initial Map Setup ──────────────────────────────────────────────────────
     useEffect(() => {
         if (!mapContainerRef.current) return;
 
@@ -105,13 +101,24 @@ export default function MapViewer() {
         mapRef.current = map;
 
         map.on('load', () => {
-            // Initialize DeckGL overlay for 3D Tiles
-            const deckOverlay = new MapboxOverlay({
-                interleaved: true,
-                layers: [], // Initially empty, controlled by effect
-            });
-            map.addControl(deckOverlay as unknown as maplibregl.IControl);
-            deckOverlayRef.current = deckOverlay;
+            // ── Add 3D Tiles as a MapLibre Custom Layer ────────────────────────
+            // ThreeDTilesLayer uses 3d-tiles-renderer (NASA/JPL) + Three.js,
+            // sharing MapLibre's existing WebGL context.  errorTarget = 0 forces
+            // the finest available LOD tiles to load progressively, and each
+            // loaded tile triggers triggerRepaint() so the canvas updates without
+            // any user interaction.
+            const tilesetUrl = `${window.location.origin}/terra_b3dms/tileset.json`;
+            // altitudeOffset (metres): raise the model above MSL if tiles appear
+            // underground.  Increase in 10–50 m steps until visible, then tune.
+            const tilesLayer = new ThreeDTilesLayer(
+                TILES_LAYER_ID,
+                tilesetUrl,
+                MAKASSAR_CENTER.lng,
+                MAKASSAR_CENTER.lat,
+                0   // ← altitudeOffset in metres; increase if model underground
+            );
+            tilesLayerRef.current = tilesLayer;
+            map.addLayer(tilesLayer as unknown as maplibregl.CustomLayerInterface);
 
             setIsLoading(false);
             setLoadingMessage('');
@@ -119,11 +126,9 @@ export default function MapViewer() {
 
         // Map Click Handler for Features
         map.on('click', (e) => {
-            // Only query if in shapefile mode or if we want to allow picking in 3D mode too?
-            // Assuming simplified experience: picking works for visible vector layers.
             const visibleLayerIds = SHAPEFILE_LAYERS
                 .map(l => l.id)
-                .filter(id => map.getLayer(id)); // only if layer exists on map
+                .filter(id => map.getLayer(id));
 
             if (visibleLayerIds.length === 0) {
                 setSelectedFeature(null);
@@ -134,7 +139,6 @@ export default function MapViewer() {
             if (features.length > 0) {
                 const feature = features[0];
                 setSelectedFeature(feature);
-                // Also set active layer to the one selected for context
                 const layerId = feature.layer.id;
                 setActiveLayerId(layerId);
             } else {
@@ -157,94 +161,25 @@ export default function MapViewer() {
         map.addControl(new maplibregl.NavigationControl(), 'top-right');
 
         return () => {
-            if (deckOverlayRef.current) {
-                map.removeControl(deckOverlayRef.current as unknown as maplibregl.IControl);
-            }
+            tilesLayerRef.current = null;
             map.remove();
         };
     }, []);
 
-    // Mobile/Desktop tuning
-    const deviceProfile = useMemo(() => DEVICE_PROFILES[getDeviceProfile()], []);
-
-    // Manage 3D Tiles Logic
-    const loadOptions = useMemo(() => ({
-        tileset: {
-            maximumScreenSpaceError: 0.75,   // lebih kecil = lebih detail
-            viewDistanceScale: 0.25,         // lebih kecil = terasa lebih dekat
-            geometricErrorMultiplier: 50,    // NAIKKAN besar (ini yang sering jadi kunci)
-            refinementStrategy: 'best-available',
-
-            // percepat refine
-            throttleRequests: false,         // MATIKAN dulu untuk test
-            maxRequests: 48,                 // naikin biar child tiles keburu masuk
-            debounceTime: 0,
-
-            maximumMemoryUsage: 3072,        // kalau desktop sanggup
-            updateTransforms: false,
-        },
-        draco: { decoderType: 'js' },
-    }), []);
-
-    const subLayerProps = useMemo(() => ({
-        scenegraph: {
-            _lighting: 'flat', // Unlit mode for baked textures
-            textureParameters: {
-                // GL.TEXTURE_MIN_FILTER: GL.LINEAR_MIPMAP_LINEAR
-                10241: 9987,
-                // GL.TEXTURE_MAG_FILTER: GL.LINEAR
-                10240: 9729,
-                // GL.TEXTURE_WRAP_S: GL.CLAMP_TO_EDGE
-                10242: 33071,
-                // GL.TEXTURE_WRAP_T: GL.CLAMP_TO_EDGE
-                10243: 33071,
-            },
-        },
-    }), []);
-
+    // ── Toggle 3D Tiles visibility ─────────────────────────────────────────────
     useEffect(() => {
-        if (!deckOverlayRef.current) return;
+        const map = mapRef.current;
+        if (!map || !map.isStyleLoaded()) return;
+        if (!map.getLayer(TILES_LAYER_ID)) return;
 
-        const layers = [];
-        if (enable3DTiles) {
-            const tile3DLayer = new Tile3DLayer({
-                id: 'tile-3d-layer',
-                data: `${window.location.origin}/terra_b3dms/tileset.json`,
-                loaders: [Tiles3DLoader, DracoLoader],
-                loadOptions: loadOptions,
-                _subLayerProps: subLayerProps,
-                onTileLoad: (tileHeader) => {
-                    const content = tileHeader.content;
-                    if (content && deckOverlayRef.current) {
-                        const deck = (deckOverlayRef.current as any)._deck;
-                        if (deck && deck.gl) {
-                            applyAnisotropyToTile(content, deck.gl, deviceProfile.anisotropyLevel);
-                        }
-                    }
-                    // Progressive loading feedback
-                    setLoadingMessage(prev => {
-                        const count = parseInt(prev.match(/\d+/)?.[0] || '0') + 1;
-                        return `Loading 3D Tiles... (${count})`;
-                    });
-                },
-                onTilesetLoad: () => {
-                    // Only show loading if we are just enabling it or starting up
-                    if (loadingProgress < 100) {
-                        setLoadingProgress(100);
-                        setLoadingMessage('3D Tiles loaded');
-                        setTimeout(() => setLoadingMessage(''), 2000);
-                    }
-                },
-                pointSize: 2,
-                opacity: 1,
-            });
-            layers.push(tile3DLayer);
-        }
+        map.setLayoutProperty(
+            TILES_LAYER_ID,
+            'visibility',
+            enable3DTiles ? 'visible' : 'none'
+        );
+    }, [enable3DTiles]);
 
-        deckOverlayRef.current.setProps({ layers });
-    }, [enable3DTiles, loadOptions, subLayerProps, loadingProgress, deviceProfile]); // Re-run when toggle changes
-
-    // Manage Shapefile Layers on MapLibre
+    // ── Manage Shapefile Layers on MapLibre ────────────────────────────────────
     useEffect(() => {
         const map = mapRef.current;
         if (!map || !map.isStyleLoaded()) return;
@@ -267,7 +202,6 @@ export default function MapViewer() {
 
             if (visible && loaded && data) {
                 if (!layerExists) {
-                    // Add Layer
                     if (config.geometryType === 'polygon') {
                         map.addLayer({
                             id: layerId,
@@ -276,10 +210,9 @@ export default function MapViewer() {
                             paint: {
                                 'fill-color': `rgba(${config.color[0]}, ${config.color[1]}, ${config.color[2]}, 1)`,
                                 'fill-opacity': opacity,
-                                'fill-outline-color': '#ffffff'
+                                'fill-outline-color': '#ffffff',
                             },
                         });
-                        // Add Outline layer for better visibility
                         map.addLayer({
                             id: `${layerId}-outline`,
                             type: 'line',
@@ -287,7 +220,7 @@ export default function MapViewer() {
                             paint: {
                                 'line-color': '#ffffff',
                                 'line-width': 1,
-                                'line-opacity': opacity
+                                'line-opacity': opacity,
                             },
                         });
                     } else if (config.geometryType === 'line') {
@@ -311,7 +244,7 @@ export default function MapViewer() {
                                 'circle-radius': 5,
                                 'circle-opacity': opacity,
                                 'circle-stroke-width': 1,
-                                'circle-stroke-color': '#ffffff'
+                                'circle-stroke-color': '#ffffff',
                             },
                         });
                     }
@@ -334,7 +267,7 @@ export default function MapViewer() {
                 if (map.getLayer(`${layerId}-outline`)) map.removeLayer(`${layerId}-outline`);
             }
         });
-    }, [layers]); // re-run when layer state changes
+    }, [layers]);
 
     const activeLayerFeatures = useMemo(() => {
         if (!activeLayerId || !layers[activeLayerId]?.data) return [];
@@ -344,14 +277,11 @@ export default function MapViewer() {
     const handleZoomToFeature = (feature: Feature) => {
         if (!mapRef.current) return;
 
-        // If feature has bbox (GeoJSON spec optional), use it
         if (feature.bbox) {
             mapRef.current.fitBounds(feature.bbox as [number, number, number, number], { padding: 50 });
             return;
         }
 
-        // Fallback: Compute simplified bbox similar to loader or just fly to first coord
-        // Use a simple centroid strategy for MVP
         let center: [number, number] | null = null;
 
         if (feature.geometry.type === 'Point') {
@@ -374,18 +304,21 @@ export default function MapViewer() {
         handleZoomToFeature(feature);
     };
 
+    // ── Derive loading indicator state ─────────────────────────────────────────
+    const shapefileLoading = Object.values(layers).find(l => l.loading);
+    const showLoading = isLoading || !!shapefileLoading;
+    const displayMessage = shapefileLoading
+        ? `Loading ${shapefileLoading.config.name}...`
+        : loadingMessage;
+
     return (
         <div className={styles.container}>
             <div ref={mapContainerRef} className={styles.map} />
 
             <LoadingIndicator
-                isLoading={isLoading || Object.values(layers).some(l => l.loading)}
-                progress={loadingProgress}
-                message={
-                    Object.values(layers).find(l => l.loading)
-                        ? `Loading ${Object.values(layers).find(l => l.loading)?.config.name}...`
-                        : loadingMessage
-                }
+                isLoading={showLoading}
+                progress={0}
+                message={displayMessage}
             />
 
             <LeftPanel
