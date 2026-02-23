@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { TilesRenderer } from '3d-tiles-renderer';
 import { GLTFExtensionsPlugin, TilesFadePlugin } from '3d-tiles-renderer/plugins';
@@ -49,12 +48,16 @@ import type { CustomRenderMethodInput } from 'maplibre-gl';
  * Mitigations applied here:
  *   1. TilesFadePlugin — cross-fades parent opacity to 0 as children fade
  *      to 1, preventing both at full opacity simultaneously.
- *   2. polygonOffset(true, 1, 1) — biases each fragment's depth by a small
- *      slope-scaled amount, separating coplanar triangles.
- *   3. gl.clear(DEPTH_BUFFER_BIT) before render — gives 3D tiles a clean
+ *   2. gl.clear(DEPTH_BUFFER_BIT) before render — gives 3D tiles a clean
  *      depth slate so MapLibre's raster depth doesn't interfere.
- *   4. FrontSide only — hides inward-facing skirt back-faces that would
+ *   3. FrontSide only — hides inward-facing skirt back-faces that would
  *      otherwise z-fight with outward-facing surfaces.
+ *
+ * NOTE: polygonOffset is intentionally NOT used.  Applying depth bias
+ * (especially double — material-level + GL-level) causes geometry layers
+ * to visually separate when viewed from oblique angles, which is worse
+ * than the z-fighting it aims to fix.  TilesFadePlugin's opacity
+ * cross-fade is sufficient.
  *
  *
  * WHY FRAGMENTATION HAPPENS FROM SIDE ANGLES
@@ -66,8 +69,11 @@ import type { CustomRenderMethodInput } from 'maplibre-gl';
  * shattered/layered appearance.  This is a fundamental limitation of 2.5D
  * photogrammetry data and cannot be fully eliminated — only reduced by:
  *   • Hiding back-faces (FrontSide)
- *   • Polygon offset to separate overlapping depth values
- *   • Vertex welding (mergeVertices) to close cracks at tile boundaries
+ *   • TilesFadePlugin cross-fade (prevents dual full-opacity overlap)
+ *
+ * NOTE: vertex welding (mergeVertices) was removed because it corrupts
+ * photogrammetry geometry — collapsing vertices with different UVs/normals
+ * creates T-junctions and texture seam artifacts.  Render raw tile data.
  *
  *
  * WHERE TO PATCH 3D-TILES-RENDERER FOR FORCED TRAVERSAL (reference only)
@@ -136,10 +142,6 @@ import type { CustomRenderMethodInput } from 'maplibre-gl';
 // | FADE_DURATION_MS       | 500     | Snappier transitions   | Smoother cross-fade     |
 // | MAX_FADE_OUT_TILES     | 100     | Less overdraw          | Smoother fading         |
 // | REPAINT_INTERVAL_MS    | 50      | Higher CPU             | Choppier loading        |
-// | POLYGON_OFFSET_FACTOR  | 1       | Less bias              | More z-fight reduction  |
-// | POLYGON_OFFSET_UNITS   | 1       | Less bias              | More z-fight reduction  |
-// | ENABLE_VERTEX_WELDING  | true    | Skip for speed         | Close cracks at seams   |
-// | WELD_TOLERANCE         | 1e-4    | Tighter welds          | Looser welds            |
 
 const SELECTION_HEIGHT_M     = 500;
 const SELECTION_FOV_DEG      = 90;
@@ -147,10 +149,6 @@ const RESOLUTION_MULTIPLIER  = 4;
 const FADE_DURATION_MS       = 500;
 const MAX_FADE_OUT_TILES     = 100;
 const REPAINT_INTERVAL_MS    = 50;
-const POLYGON_OFFSET_FACTOR  = 1;
-const POLYGON_OFFSET_UNITS   = 1;
-const ENABLE_VERTEX_WELDING  = true;
-const WELD_TOLERANCE         = 1e-4;
 
 // ── Geo constants ────────────────────────────────────────────────────────────
 const EARTH_CIRCUMFERENCE = 40_075_016.686;
@@ -174,6 +172,35 @@ function lngLatToECEF(
     ];
 }
 
+/**
+ * Build a 4×4 matrix that transforms ECEF coordinates into the coordinate
+ * system expected by MapLibre's `modelViewProjectionMatrix` (which is the
+ * internal `_viewProjMatrix` — see mercator_transform.ts:640).
+ *
+ * MapLibre's _viewProjMatrix expects:
+ *   X, Y → worldSize-scaled Mercator coordinates  (range [0, worldSize])
+ *   Z    → altitude in **metres**                  (the matrix internally
+ *          multiplies Z by pixelsPerMeter = worldSize / circumference(lat)
+ *          to bring it into the same worldSize-scaled space as X/Y)
+ *
+ * See mercator_transform.ts lines 626, 630, 633:
+ *   mat4.translate(m, m, [-x, -y, 0]);          // x,y in worldSize-scaled
+ *   _mercatorMatrix = m × scale(worldSize);      // separate copy for [0,1]
+ *   mat4.scale(m, m, [1, 1, pixelsPerMeter]);    // Z metres → worldSize
+ *
+ * Therefore:
+ *   • Rows 0 & 1 (X, Y) scale by sH = worldSize / (circumference × cosφ)
+ *     to convert ECEF metre offsets to worldSize-scaled Mercator.
+ *   • Row 2 (Z) uses scale = 1.0 to output metres directly, because the
+ *     MVP already applies the pixelsPerMeter Z-scaling internally.
+ *
+ * PRIOR BUG:  Row 2 used sV = worldSize / circumference, which meant Z
+ * was in worldSize-scaled units.  The MVP then multiplied Z *again* by
+ * pixelsPerMeter (≈ worldSize / circumference), giving an effective Z scale
+ * of worldSize² / circumference² — growing quadratically with zoom.
+ * This caused vertical "stretching upward" that worsened as the user
+ * zoomed in.
+ */
 function buildEcefToMercatorMatrix(
     lng0: number,
     lat0: number,
@@ -185,28 +212,37 @@ function buildEcefToMercatorMatrix(
     const sinλ = Math.sin(λ), cosλ = Math.cos(λ);
     const sinφ = Math.sin(φ), cosφ = Math.cos(φ);
 
+    // ENU (East-North-Up) basis vectors at the tangent point on WGS84
     const Ex = -sinλ,        Ey =  cosλ,        Ez = 0;
     const Nx = -sinφ * cosλ, Ny = -sinφ * sinλ, Nz = cosφ;
     const Ux =  cosφ * cosλ, Uy =  cosφ * sinλ, Uz = sinφ;
 
+    // Horizontal scale: ECEF metres → worldSize-scaled Mercator.
+    // The Mercator projection is conformal, so the E and N directions
+    // share the same scale factor = 1 / (circumference × cosφ) × worldSize.
     const sH = worldSize / (EARTH_CIRCUMFERENCE * cosφ);
-    const sV = worldSize / EARTH_CIRCUMFERENCE;
+
+    // Z scale: 1.0 (output metres directly; the MVP handles the rest).
+    // Do NOT multiply by worldSize here — the MVP already applies
+    // pixelsPerMeter = worldSize / circumference(lat) to Z internally.
 
     const [Cx, Cy, Cz] = lngLatToECEF(lng0, lat0, 0);
 
+    // Mercator position of the tangent point (worldSize-scaled)
     const mx0 = (lng0 + 180) / 360;
     const my0 =
         (1 - Math.log(Math.tan(Math.PI / 4 + (lat0 * Math.PI) / 360)) / Math.PI) / 2;
 
+    // Translation: the matrix maps the ECEF centre C to (mx0*ws, my0*ws, 0+offset)
     const tx =  mx0 * worldSize - sH * (Ex * Cx + Ey * Cy + Ez * Cz);
     const ty =  my0 * worldSize + sH * (Nx * Cx + Ny * Cy + Nz * Cz);
-    const tz = -sV * (Ux * Cx + Uy * Cy + Uz * Cz) + altitudeOffset * sV;
+    const tz = -(Ux * Cx + Uy * Cy + Uz * Cz) + altitudeOffset;
 
     return new THREE.Matrix4().set(
          sH * Ex,  sH * Ey,  sH * Ez,  tx,
         -sH * Nx, -sH * Ny, -sH * Nz,  ty,
-         sV * Ux,  sV * Uy,  sV * Uz,  tz,
-         0,        0,        0,         1
+              Ux,       Uy,       Uz,   tz,
+              0,        0,        0,    1
     );
 }
 
@@ -217,64 +253,27 @@ function buildEcefToMercatorMatrix(
 /**
  * Process a loaded tile's scene graph:
  *
- * 1. Vertex welding (mergeVertices) — photogrammetry tiles are cut from a
- *    continuous surface.  Where the cut happens, vertices that SHOULD be
- *    shared are duplicated with slightly different positions.  This creates
- *    hairline cracks visible as dark lines.  mergeVertices snaps vertices
- *    within WELD_TOLERANCE to the same position and builds a shared index,
- *    closing these cracks.
+ * Material replacement only — creates an unlit MeshBasicMaterial with:
+ *   • map/color preserved from the original material
+ *   • FrontSide — hides skirt back-faces (see header comment)
+ *   • depthWrite = true — ensures this tile's fragments contribute to the
+ *     depth buffer so subsequent tiles respect occlusion
  *
- * 2. Normal recomputation — after welding, normals are recomputed from the
- *    merged geometry so that shared vertices get averaged normals, producing
- *    a smoother surface instead of per-face flat shading.  This doesn't
- *    affect MeshBasicMaterial rendering (which ignores normals) but is
- *    stored in case materials are later changed for debugging.
- *
- * 3. Material replacement — creates an unlit MeshBasicMaterial with:
- *    • map/color preserved from the original material
- *    • FrontSide — hides skirt back-faces (see header comment)
- *    • polygonOffset — biases depth by (FACTOR, UNITS) to reduce z-fighting
- *      between overlapping parent/child tiles during LOD transitions
- *    • depthWrite = true — ensures this tile's fragments contribute to the
- *      depth buffer so subsequent tiles respect occlusion
+ * Photogrammetry tiles are pre-optimized.  We do NOT modify geometry:
+ *   • No vertex welding (mergeVertices) — collapsing vertices that share
+ *     position but have different UVs/normals corrupts the mesh, creating
+ *     T-junctions and triangle explosions.
+ *   • No normal recomputation — MeshBasicMaterial ignores normals, and
+ *     recomputing on already-correct geometry is wasteful at best,
+ *     destructive at worst.
+ *   • No polygonOffset — applying depth bias causes geometry layers to
+ *     visually separate when viewed from oblique angles.  TilesFadePlugin
+ *     handles parent/child overlap via opacity cross-fade instead.
  */
 function processLoadedScene(root: THREE.Object3D): void {
     root.traverse((obj: any) => {
         if (!obj.isMesh) return;
 
-        let geo = obj.geometry as THREE.BufferGeometry | undefined;
-        if (!geo) return;
-
-        // ── Step 1: Vertex welding ───────────────────────────────────────
-        // mergeVertices returns a NEW geometry; the original is untouched.
-        // On indexed geometry it deduplicates by attribute values within
-        // tolerance.  On non-indexed geometry it creates an index.
-        // Either way, coincident vertices at tile boundaries get merged,
-        // closing hairline cracks.
-        if (ENABLE_VERTEX_WELDING) {
-            try {
-                const merged = mergeVertices(geo, WELD_TOLERANCE);
-                if (merged && merged !== geo) {
-                    obj.geometry = merged;
-                    geo = merged;
-                }
-            } catch {
-                // mergeVertices can fail on unusual attribute layouts;
-                // proceed with the original geometry.
-            }
-        }
-
-        // ── Step 2: Normals ──────────────────────────────────────────────
-        // Compute normals AFTER welding so shared vertices get averaged
-        // face normals → smoother surface.  If normals already exist they
-        // are overwritten with the welded version.
-        try {
-            geo.computeVertexNormals();
-        } catch {
-            // Non-critical; MeshBasicMaterial doesn't use normals.
-        }
-
-        // ── Step 3: Material replacement ─────────────────────────────────
         const src = obj.material;
         if (!src) return;
 
@@ -285,17 +284,6 @@ function processLoadedScene(root: THREE.Object3D): void {
             side:        THREE.FrontSide,
             depthWrite:  true,
             depthTest:   true,
-
-            // polygonOffset: pushes each fragment's depth value by
-            //   offset = factor × DZ + units × minResolvable
-            // where DZ is the maximum depth slope across the polygon.
-            // A positive factor pushes fragments AWAY from the camera,
-            // which means earlier-drawn (parent) tiles are pushed back and
-            // later-drawn (child) tiles win the depth test.  This reduces
-            // the noisy interleaving between parent and child geometry.
-            polygonOffset:       true,
-            polygonOffsetFactor: POLYGON_OFFSET_FACTOR,
-            polygonOffsetUnits:  POLYGON_OFFSET_UNITS,
         });
     });
 }
@@ -601,7 +589,7 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         // ── 3. Advance tile streaming ────────────────────────────────────────
         this.tilesRenderer.update();
 
-        // ── 4. Render with clean depth + polygon offset ──────────────────────
+        // ── 4. Render with clean depth ────────────────────────────────────────
         const prevFBO = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
 
         // Clear ONLY depth — colour buffer retains MapLibre's raster map.
@@ -612,18 +600,10 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         gl.depthMask(true);
         gl.clear(gl.DEPTH_BUFFER_BIT);
 
-        // Enable polygon offset at the GL level as well (belt-and-suspenders
-        // with the material-level polygonOffset).  Three.js respects material
-        // settings, but the raw GL call guarantees it's active even if
-        // Three.js's state cache is stale.
-        gl.enable(gl.POLYGON_OFFSET_FILL);
-        gl.polygonOffset(POLYGON_OFFSET_FACTOR, POLYGON_OFFSET_UNITS);
-
         this.renderer.state.reset();
         this.renderer.render(this.scene, this.renderCamera);
 
         // Restore GL state for MapLibre.
-        gl.disable(gl.POLYGON_OFFSET_FILL);
         gl.bindFramebuffer(gl.FRAMEBUFFER, prevFBO);
         this.renderer.state.reset();
 
