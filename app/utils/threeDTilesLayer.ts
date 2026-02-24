@@ -253,25 +253,28 @@ function buildEcefToMercatorMatrix(
 /**
  * Process a loaded tile's scene graph:
  *
- * Material replacement only — creates an unlit MeshBasicMaterial with:
- *   • map/color preserved from the original material
- *   • FrontSide — hides skirt back-faces (see header comment)
- *   • depthWrite = true — ensures this tile's fragments contribute to the
- *     depth buffer so subsequent tiles respect occlusion
+ * 1. Disable Three.js frustum culling — the combined projection matrix
+ *    (mercatorToClip × ecefToMerc) maps from ECEF (coordinates ~10⁶) to
+ *    clip space ([-1,1]).  When Three.js extracts frustum planes from this
+ *    matrix, numerical precision issues cause valid meshes to be incorrectly
+ *    culled.  This produces holes that worsen as the MapLibre camera moves.
+ *    We rely on 3d-tiles-renderer's tile-level frustum culling (via lodCamera)
+ *    instead — it operates on proper OBB/sphere bounding volumes.
  *
- * Photogrammetry tiles are pre-optimized.  We do NOT modify geometry:
- *   • No vertex welding (mergeVertices) — collapsing vertices that share
- *     position but have different UVs/normals corrupts the mesh, creating
- *     T-junctions and triangle explosions.
- *   • No normal recomputation — MeshBasicMaterial ignores normals, and
- *     recomputing on already-correct geometry is wasteful at best,
- *     destructive at worst.
- *   • No polygonOffset — applying depth bias causes geometry layers to
- *     visually separate when viewed from oblique angles.  TilesFadePlugin
- *     handles parent/child overlap via opacity cross-fade instead.
+ * 2. Material replacement — creates an unlit MeshBasicMaterial with:
+ *    • map/color preserved from the original material
+ *    • FrontSide — hides skirt back-faces (see header comment)
+ *    • depthWrite = true — ensures this tile's fragments contribute to the
+ *      depth buffer so subsequent tiles respect occlusion
+ *
+ * Photogrammetry tiles are pre-optimized.  We do NOT modify geometry.
  */
 function processLoadedScene(root: THREE.Object3D): void {
     root.traverse((obj: any) => {
+        // Disable Three.js mesh-level frustum culling for ALL objects
+        // (groups, meshes, etc.) in the tile scene graph.
+        obj.frustumCulled = false;
+
         if (!obj.isMesh) return;
 
         const src = obj.material;
@@ -402,10 +405,15 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         this.lodCamera.updateProjectionMatrix();
         this.lodCamera.updateMatrixWorld(true);
 
-        // RENDER CAMERA: projectionMatrix overwritten per-frame.
+        // RENDER CAMERA: matrices set per-frame in render().
+        // We override updateMatrixWorld to prevent Three.js from
+        // recomputing our manually-set matrixWorld/matrixWorldInverse
+        // during renderer.render().  See render() for the GPU precision
+        // comment explaining WHY we split projectionMatrix and
+        // matrixWorldInverse instead of using a single combined matrix.
         this.renderCamera = new THREE.Camera();
-        this.renderCamera.matrixWorld.identity();
-        this.renderCamera.matrixWorldInverse.identity();
+        this.renderCamera.matrixAutoUpdate = false;
+        this.renderCamera.updateMatrixWorld = function() {};
 
         // ── Scene ────────────────────────────────────────────────────────────
         // Lights are harmless on MeshBasicMaterial; useful if materials are
@@ -431,9 +439,12 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         // child starts loading, creating holes.
         if ('displayActiveTiles'    in tr) tr.displayActiveTiles    = true;
 
-        // optimizedLoadStrategy: loads only the tiles satisfying the current
-        // SSE threshold rather than the full parent→child hierarchy.
-        if ('optimizedLoadStrategy' in tr) tr.optimizedLoadStrategy = true;
+        // optimizedLoadStrategy: DISABLED for photogrammetry.
+        // The optimized traversal ("stop at first ready tile") can show
+        // partial sets of children before all siblings have loaded, creating
+        // holes with REPLACE refine mode.  The standard traversal waits for
+        // ALL children before removing the parent.
+        if ('optimizedLoadStrategy' in tr) tr.optimizedLoadStrategy = false;
 
         // loadSiblings: when one child of a parent loads, all its siblings
         // must also load before the parent can be removed.  Prevents
@@ -445,7 +456,7 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         // fade shader wraps our MeshBasicMaterial, not the original PBR.
         //
         // Event ordering:
-        //   1. Our listener → replaces material + welds vertices
+        //   1. Our listener → disables frustumCulled + replaces material
         //   2. TilesFadePlugin listener → wraps our material with fade shader
         //
         // addEventListener preserves registration order for dispatch.
@@ -563,7 +574,40 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         );
         // lodCamera position & orientation stay FIXED from onAdd.
 
-        // ── 2. Build renderCamera from MapLibre MVP ──────────────────────────
+        // ── 2. Build renderCamera — GPU precision fix ────────────────────────
+        //
+        // GPU PRECISION FIX — Camera-Relative Transform Splitting
+        // ────────────────────────────────────────────────────────
+        // Problem:  putting the full ECEF→clip pipeline into one matrix
+        //   (projectionMatrix = mercatorToClip × ecefToMerc, matrixWorldInverse = I)
+        //   means the vertex shader does ALL arithmetic in Float32:
+        //
+        //   gl_Position = combined × tileMatrixWorld × vec4(position, 1)
+        //
+        //   tileMatrixWorld × position produces ECEF coords (~6 × 10⁶ m).
+        //   combined then subtracts a ~2 × 10⁷ Mercator translation.
+        //   Float32 has ~7 significant digits → 22 000 025 − 22 000 000 = 0 or 32.
+        //   A 25 m detail is LOST.  This catastrophic cancellation causes
+        //   fragmented edges, floating geometry, and depth shimmering.
+        //
+        // Fix:  split the pipeline into two matrices:
+        //
+        //   matrixWorldInverse = ecefToMercRel    (ECEF → camera-relative Mercator)
+        //   projectionMatrix   = adjustedMVP      (camera-relative Mercator → clip)
+        //
+        // Three.js computes modelViewMatrix = matrixWorldInverse × object.matrixWorld
+        // in JavaScript (Float64, ~16 digits).  The ECEF → Mercator conversion
+        // including its large-value cancellation happens here, with full precision.
+        // The result is camera-relative Mercator coords (small: ±hundreds of m).
+        //
+        // The GPU then only does:  gl_Position = adjustedMVP × smallCoords
+        //   → no catastrophic cancellation.  Float32 is sufficient.
+        //
+        // Proof of equivalence:
+        //   adjustedMVP × ecefToMercRel
+        //   = mercatorToClip × translate(cam) × (ecefToMerc − translate(cam))
+        //   = mercatorToClip × ecefToMerc    (the translate pair cancels)     ✓
+        //
         const rawMat = options.modelViewProjectionMatrix;
         const mercatorToClip = new THREE.Matrix4().fromArray(
             rawMat instanceof Float64Array
@@ -580,11 +624,33 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         const ecefToMerc = buildEcefToMercatorMatrix(
             this.lng0, this.lat0, this.altitudeOffset, worldSize
         );
-        const combined = new THREE.Matrix4().multiplyMatrices(
-            mercatorToClip, ecefToMerc
+
+        // Camera center in worldSize-scaled Mercator coordinates
+        const center = this.map.getCenter();
+        const camMercX = ((center.lng + 180) / 360) * worldSize;
+        const camMercY =
+            ((1 - Math.log(Math.tan(Math.PI / 4 + (center.lat * Math.PI) / 360)) / Math.PI) / 2) * worldSize;
+
+        // ecefToMercRel: same rotation/scale as ecefToMerc, but
+        // translation is camera-relative  (subtract camera Mercator XY).
+        const ecefToMercRel = ecefToMerc.clone();
+        ecefToMercRel.elements[12] -= camMercX;  // column-major tx
+        ecefToMercRel.elements[13] -= camMercY;  // column-major ty
+
+        // adjustedMVP: re-adds the camera position so the net result
+        // is mathematically identical to mercatorToClip × ecefToMerc.
+        const camTranslate = new THREE.Matrix4().makeTranslation(
+            camMercX, camMercY, 0
         );
-        this.renderCamera.projectionMatrix       = combined;
-        this.renderCamera.projectionMatrixInverse = combined.clone().invert();
+        const adjustedMVP = new THREE.Matrix4().multiplyMatrices(
+            mercatorToClip, camTranslate
+        );
+
+        // Set camera matrices for split rendering
+        this.renderCamera.projectionMatrix.copy(adjustedMVP);
+        this.renderCamera.projectionMatrixInverse.copy(adjustedMVP).invert();
+        this.renderCamera.matrixWorldInverse.copy(ecefToMercRel);
+        this.renderCamera.matrixWorld.copy(ecefToMercRel).invert();
 
         // ── 3. Advance tile streaming ────────────────────────────────────────
         this.tilesRenderer.update();
@@ -628,4 +694,179 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         this.renderCamera  = null;
         this.map           = null;
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DEBUG VALIDATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Validate the ECEF→Mercator transform math.  Call from browser console:
+ *
+ *     import { debugValidateTransform } from './utils/threeDTilesLayer'
+ *     debugValidateTransform(119.41, -5.14)
+ *
+ * Expected output:
+ *   ✓ Center maps to (mx0*ws, my0*ws, offset)
+ *   ✓ Z is linear: 100m offset → Z delta = 100
+ *   ✓ Horizontal 100m east → X delta ≈ sH*100
+ *   ✓ No worldSize in Z
+ */
+export function debugValidateTransform(
+    lng = 119.41,
+    lat = -5.14,
+    altOffset = 0
+): void {
+    const ws = 512 * Math.pow(2, 16); // zoom 16
+
+    const M = buildEcefToMercatorMatrix(lng, lat, altOffset, ws);
+
+    // -- Test 1: center ECEF → expected Mercator position --
+    const C = new THREE.Vector4(...lngLatToECEF(lng, lat, 0), 1);
+    const pCenter = C.clone().applyMatrix4(M);
+
+    const mx0 = (lng + 180) / 360;
+    const my0 =
+        (1 - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) / Math.PI) / 2;
+
+    const xErr = Math.abs(pCenter.x - mx0 * ws);
+    const yErr = Math.abs(pCenter.y - my0 * ws);
+    const zErr = Math.abs(pCenter.z - altOffset);
+
+    console.log('=== Transform Validation ===');
+    console.log(`worldSize: ${ws}  (zoom 16)`);
+    console.log(`Center ECEF: [${C.x.toFixed(1)}, ${C.y.toFixed(1)}, ${C.z.toFixed(1)}]`);
+    console.log(`Mapped to:   [${pCenter.x.toFixed(4)}, ${pCenter.y.toFixed(4)}, ${pCenter.z.toFixed(4)}]`);
+    console.log(`Expected:    [${(mx0 * ws).toFixed(4)}, ${(my0 * ws).toFixed(4)}, ${altOffset}]`);
+    console.log(xErr < 0.01 ? '  ✓ X correct' : `  ✗ X error: ${xErr}`);
+    console.log(yErr < 0.01 ? '  ✓ Y correct' : `  ✗ Y error: ${yErr}`);
+    console.log(zErr < 0.01 ? '  ✓ Z correct' : `  ✗ Z error: ${zErr}`);
+
+    // -- Test 2: Z linearity (100m above center) --
+    const C100 = new THREE.Vector4(...lngLatToECEF(lng, lat, 100), 1);
+    const p100 = C100.clone().applyMatrix4(M);
+    const zDelta = p100.z - pCenter.z;
+
+    console.log(`\nZ linearity: 100m altitude → Z delta = ${zDelta.toFixed(4)}`);
+    console.log(
+        Math.abs(zDelta - 100) < 0.5
+            ? '  ✓ Z delta ≈ 100 (metres, not worldSize-scaled)'
+            : `  ✗ Z delta should be ~100, got ${zDelta.toFixed(2)} — likely double-scaled`
+    );
+
+    // -- Test 3: Z must NOT scale with worldSize --
+    const ws2 = 512 * Math.pow(2, 20); // zoom 20
+    const M2 = buildEcefToMercatorMatrix(lng, lat, altOffset, ws2);
+    const p100z20 = C100.clone().applyMatrix4(M2);
+    const pCz20   = C.clone().applyMatrix4(M2);
+    const zDelta20 = p100z20.z - pCz20.z;
+
+    console.log(`\nZ at zoom 20: 100m altitude → Z delta = ${zDelta20.toFixed(4)}`);
+    console.log(
+        Math.abs(zDelta20 - zDelta) < 0.01
+            ? '  ✓ Z is zoom-independent (same at zoom 16 and 20)'
+            : `  ✗ Z changed with zoom: z16=${zDelta.toFixed(4)}, z20=${zDelta20.toFixed(4)} — BUG`
+    );
+
+    // -- Test 4: Horizontal scale check --
+    const φ = (lat * Math.PI) / 180;
+    const sH = ws / (EARTH_CIRCUMFERENCE * Math.cos(φ));
+
+    // Approximate: 100m east from center
+    const eastECEF = lngLatToECEF(lng + 100 / (111320 * Math.cos(φ)), lat, 0);
+    const pEast = new THREE.Vector4(...eastECEF, 1).applyMatrix4(M);
+    const xDelta = pEast.x - pCenter.x;
+    const expectedXDelta = sH * 100;
+
+    console.log(`\nHorizontal: 100m east → X delta = ${xDelta.toFixed(4)}`);
+    console.log(`Expected X delta ≈ ${expectedXDelta.toFixed(4)} (sH × 100)`);
+    console.log(
+        Math.abs(xDelta - expectedXDelta) / expectedXDelta < 0.01
+            ? '  ✓ Horizontal scale correct'
+            : `  ✗ Horizontal scale mismatch`
+    );
+
+    // -- Test 5: Float32 precision — combined vs split matrices --
+    console.log('\n=== GPU Precision Test (Float32 simulation) ===');
+    debugFloat32Precision(lng, lat, altOffset);
+}
+
+/**
+ * Simulate GPU Float32 arithmetic to demonstrate the precision difference
+ * between the old combined-matrix approach and the new split approach.
+ *
+ * Call from browser console:
+ *   import { debugFloat32Precision } from './utils/threeDTilesLayer'
+ *   debugFloat32Precision(119.41, -5.14)
+ */
+export function debugFloat32Precision(
+    lng = 119.41,
+    lat = -5.14,
+    altOffset = 0
+): void {
+    const ws = 512 * Math.pow(2, 16); // zoom 16
+    const ecefToMerc = buildEcefToMercatorMatrix(lng, lat, altOffset, ws);
+
+    // Mock MVP: a simplified Mercator-to-clip that centers + scales.
+    // In production this is MapLibre's _viewProjMatrix.
+    const camMercX = ((lng + 180) / 360) * ws;
+    const camMercY =
+        ((1 - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) / Math.PI) / 2) * ws;
+    const mockMVP = new THREE.Matrix4().set(
+        1, 0, 0, -camMercX,
+        0, 1, 0, -camMercY,
+        0, 0, 1,  0,
+        0, 0, 0,  1
+    );
+
+    // Two nearby points: center and 10m east
+    const [Cx, Cy, Cz] = lngLatToECEF(lng, lat, 0);
+    const phi = (lat * Math.PI) / 180;
+    const dLng = 10 / (111320 * Math.cos(phi));
+    const [Ex, Ey, Ez] = lngLatToECEF(lng + dLng, lat, 0);
+
+    // ── Approach A: Combined matrix (old — GPU does everything in Float32) ──
+    const combined = new THREE.Matrix4().multiplyMatrices(mockMVP, ecefToMerc);
+    // Simulate Float32 by truncating matrix elements
+    const cElems = new Float32Array(combined.elements);
+
+    // Simulate tile matrixWorld = identity (tile verts already in ECEF)
+    // GPU: result = combined_f32 × position_f32
+    const cx32 = Math.fround(Cx), cy32 = Math.fround(Cy), cz32 = Math.fround(Cz);
+    const ex32 = Math.fround(Ex), ey32 = Math.fround(Ey), ez32 = Math.fround(Ez);
+
+    const outCx_A = Math.fround(Math.fround(cElems[0] * cx32) + Math.fround(cElems[4] * cy32) + Math.fround(cElems[8] * cz32) + cElems[12]);
+    const outEx_A = Math.fround(Math.fround(cElems[0] * ex32) + Math.fround(cElems[4] * ey32) + Math.fround(cElems[8] * ez32) + cElems[12]);
+    const deltaA = outEx_A - outCx_A;
+
+    // ── Approach B: Split matrix (new — ECEF→Merc in Float64, GPU gets small values) ──
+    const ecefToMercRel = ecefToMerc.clone();
+    ecefToMercRel.elements[12] -= camMercX;
+    ecefToMercRel.elements[13] -= camMercY;
+
+    // CPU (Float64): modelViewMatrix × position
+    const mvC_x = ecefToMercRel.elements[0] * Cx + ecefToMercRel.elements[4] * Cy + ecefToMercRel.elements[8] * Cz + ecefToMercRel.elements[12];
+    const mvE_x = ecefToMercRel.elements[0] * Ex + ecefToMercRel.elements[4] * Ey + ecefToMercRel.elements[8] * Ez + ecefToMercRel.elements[12];
+
+    // These are camera-relative Mercator → small values → safe for Float32
+    const mvC_x32 = Math.fround(mvC_x);
+    const mvE_x32 = Math.fround(mvE_x);
+
+    // GPU: adjustedMVP × camera_relative (trivial identity-like in our mock)
+    const deltaB = mvE_x32 - mvC_x32;
+
+    // ── Reference (Float64) ──
+    const refC_x = ecefToMerc.elements[0] * Cx + ecefToMerc.elements[4] * Cy + ecefToMerc.elements[8] * Cz + ecefToMerc.elements[12];
+    const refE_x = ecefToMerc.elements[0] * Ex + ecefToMerc.elements[4] * Ey + ecefToMerc.elements[8] * Ez + ecefToMerc.elements[12];
+    const deltaRef = (refE_x - camMercX) - (refC_x - camMercX);
+
+    console.log(`10m east displacement (X axis, worldSize-scaled):`);
+    console.log(`  Float64 reference:   ${deltaRef.toFixed(6)}`);
+    console.log(`  Combined (Float32):  ${deltaA.toFixed(6)}  error: ${Math.abs(deltaA - deltaRef).toFixed(6)}`);
+    console.log(`  Split (Float32):     ${deltaB.toFixed(6)}  error: ${Math.abs(deltaB - deltaRef).toFixed(6)}`);
+    console.log(
+        Math.abs(deltaB - deltaRef) < Math.abs(deltaA - deltaRef)
+            ? '  ✓ Split approach has better precision'
+            : '  info: Both approaches have similar precision at this scale'
+    );
 }
