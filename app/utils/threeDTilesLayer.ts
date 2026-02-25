@@ -267,9 +267,16 @@ function buildEcefToMercatorMatrix(
  *    • depthWrite = true — ensures this tile's fragments contribute to the
  *      depth buffer so subsequent tiles respect occlusion
  *
+ * 3. Texture quality maximisation — sets anisotropic filtering to the GPU's
+ *    maximum supported level on every texture.  Without this, textures
+ *    viewed at oblique angles appear blurred because the GPU averages
+ *    texels over a square footprint instead of an elongated one.
+ *    Anisotropic filtering extends the sampling footprint along the
+ *    direction of maximum compression, preserving detail.
+ *
  * Photogrammetry tiles are pre-optimized.  We do NOT modify geometry.
  */
-function processLoadedScene(root: THREE.Object3D): void {
+function processLoadedScene(root: THREE.Object3D, maxAnisotropy: number): void {
     root.traverse((obj: any) => {
         // Disable Three.js mesh-level frustum culling for ALL objects
         // (groups, meshes, etc.) in the tile scene graph.
@@ -280,8 +287,17 @@ function processLoadedScene(root: THREE.Object3D): void {
         const src = obj.material;
         if (!src) return;
 
+        // Maximise texture sharpness before creating the replacement material.
+        const tex = src.map as THREE.Texture | null;
+        if (tex) {
+            tex.anisotropy = maxAnisotropy;
+            tex.minFilter  = THREE.LinearMipmapLinearFilter;
+            tex.magFilter  = THREE.LinearFilter;
+            tex.needsUpdate = true;
+        }
+
         obj.material = new THREE.MeshBasicMaterial({
-            map:         src.map         ?? null,
+            map:         tex,
             color:       src.color       ?? 0xffffff,
             transparent: src.transparent ?? false,
             side:        THREE.FrontSide,
@@ -315,7 +331,8 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
     private tilesRenderer: TilesRenderer | null = null;
     private dracoLoader:   DRACOLoader   | null = null;
 
-    private repaintTimer: ReturnType<typeof setInterval> | null = null;
+    private repaintTimer:  ReturnType<typeof setInterval> | null = null;
+    private maxAnisotropy: number = 1;
 
     constructor(
         id: string,
@@ -382,6 +399,9 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         this.renderer.autoClearDepth   = false;
         this.renderer.autoClearStencil = false;
         this.renderer.shadowMap.enabled = false;
+
+        // Capture GPU max anisotropy for texture quality maximisation.
+        this.maxAnisotropy = this.renderer.capabilities.getMaxAnisotropy();
 
         // ── Cameras ──────────────────────────────────────────────────────────
 
@@ -451,6 +471,34 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         // partial display of a tile set's children.
         if ('loadSiblings'          in tr) tr.loadSiblings          = true;
 
+        // ── LRU cache — prevent tile eviction ─────────────────────────────
+        // Default: maxBytesSize = 0.4 GB, maxSize = 8000 tiles.
+        // For maximum-detail mode we disable byte-based eviction entirely
+        // so that every leaf tile stays resident once loaded.  The tile
+        // count limit (maxSize) is kept high as a safety net.
+        //
+        // For this tileset (473 tiles, 119 MB on disk) the uncompressed GPU
+        // memory footprint (textures + geometry buffers) can be 3–5× larger
+        // than the compressed file size.  The default 0.4 GB limit would
+        // trigger eviction and cause loaded leaves to cycle in and out.
+        const lru = (this.tilesRenderer as any).lruCache;
+        if (lru) {
+            lru.maxBytesSize = 4 * 1024 * 1024 * 1024; // 4 GB
+            lru.minBytesSize = 3 * 1024 * 1024 * 1024; // 3 GB
+            lru.maxSize      = 20000;
+            lru.minSize      = 16000;
+        }
+
+        // ── Download / parse queues — faster convergence ──────────────────
+        // Increase concurrent downloads from 25→50 and parse jobs from 5→10
+        // to reduce time-to-full-detail for the progressive sub-tileset
+        // chain (24 JSON files must be fetched before their children are
+        // discovered by the traversal).
+        const dq = (this.tilesRenderer as any).downloadQueue;
+        const pq = (this.tilesRenderer as any).parseQueue;
+        if (dq) dq.maxJobs = 50;
+        if (pq) pq.maxJobs = 10;
+
         // ── Mesh post-processing (BEFORE fade plugin) ────────────────────────
         // This listener MUST be registered before TilesFadePlugin so the
         // fade shader wraps our MeshBasicMaterial, not the original PBR.
@@ -472,7 +520,7 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
                 );
                 return;
             }
-            processLoadedScene(root);
+            processLoadedScene(root, this.maxAnisotropy);
         });
 
         // ── Plugins ──────────────────────────────────────────────────────────
@@ -511,7 +559,7 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
             map.triggerRepaint();
             this.startRepaintLoop();
         };
-        this.tilesRenderer.addEventListener('load-tile-set', kick);
+        this.tilesRenderer.addEventListener('load-tileset', kick);
         this.tilesRenderer.addEventListener('load-model',    kick);
         this.tilesRenderer.addEventListener('needs-render',  kick);
 
@@ -548,6 +596,9 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         });
 
         this.scene.add(this.tilesRenderer.group);
+
+        // Expose for browser console debugging:  window.__tilesLayer.debugTileStats()
+        (globalThis as any).__tilesLayer = this;
 
         // Seed the render loop.
         map.triggerRepaint();
@@ -679,11 +730,97 @@ export class ThreeDTilesLayer implements maplibregl.CustomLayerInterface {
         }
     }
 
+    // ── Debug: verify leaf tile loading ─────────────────────────────────
+
+    /**
+     * Log tile loading statistics to the console.  Call from the browser
+     * console via the layer reference:
+     *
+     *   tilesLayer.debugTileStats()
+     *
+     * Output includes:
+     *   • LRU cache occupancy (count + bytes)
+     *   • Download/parse queue state
+     *   • Stats counters (loaded, visible, downloading, etc.)
+     *   • Tile tree depth walk (max depth reached, leaf count)
+     */
+    debugTileStats(): void {
+        if (!this.tilesRenderer) {
+            console.warn('[debugTileStats] tilesRenderer not initialised');
+            return;
+        }
+        const tr = this.tilesRenderer as any;
+
+        // ── Stats ─────────────────────────────────────────────────
+        const s = tr.stats;
+        if (s) {
+            console.log('[TileStats] downloading:', s.downloading,
+                '| parsing:', s.parsing,
+                '| queued:', s.queued,
+                '| loaded:', s.loaded,
+                '| failed:', s.failed,
+                '| visible:', s.visible,
+                '| active:', s.active,
+                '| used:', s.used);
+        }
+
+        // ── LRU cache ────────────────────────────────────────────
+        const lru = tr.lruCache;
+        if (lru) {
+            const mb = (lru.cachedBytes / (1024 * 1024)).toFixed(1);
+            const maxMb = (lru.maxBytesSize / (1024 * 1024)).toFixed(0);
+            console.log(`[TileStats] LRU cache: ${lru.itemSet.size} tiles, `
+                + `${mb} MB / ${maxMb} MB`);
+        }
+
+        // ── Queue state ──────────────────────────────────────────
+        const dq = tr.downloadQueue;
+        const pq = tr.parseQueue;
+        if (dq) console.log('[TileStats] downloadQueue: running=', dq.running,
+            'queued=', dq._queue?.length ?? '?', 'maxJobs=', dq.maxJobs);
+        if (pq) console.log('[TileStats] parseQueue: running=', pq.running,
+            'queued=', pq._queue?.length ?? '?', 'maxJobs=', pq.maxJobs);
+
+        // ── Tree walk: count depth + leaves ──────────────────────
+        const root = tr.root;
+        if (!root) {
+            console.log('[TileStats] root tile not yet loaded');
+            return;
+        }
+        let maxDepth = 0;
+        let leafCount = 0;
+        let totalCount = 0;
+        const depthCounts: Record<number, number> = {};
+
+        const walk = (tile: any, depth: number) => {
+            totalCount++;
+            if (depth > maxDepth) maxDepth = depth;
+            depthCounts[depth] = (depthCounts[depth] ?? 0) + 1;
+
+            const kids = tile.children ?? [];
+            if (kids.length === 0) {
+                leafCount++;
+            }
+            for (const child of kids) {
+                walk(child, depth + 1);
+            }
+        };
+        walk(root, 0);
+
+        console.log(`[TileStats] tree: ${totalCount} total tiles, `
+            + `${leafCount} leaves, max depth ${maxDepth}`);
+        console.log('[TileStats] tiles per depth:', depthCounts);
+        console.log('[TileStats] maxAnisotropy:', this.maxAnisotropy);
+    }
+
     onRemove(
         _map: maplibregl.Map,
         _gl: WebGLRenderingContext | WebGL2RenderingContext
     ): void {
         this.stopRepaintLoop();
+        if ((globalThis as any).__tilesLayer === this) {
+            delete (globalThis as any).__tilesLayer;
+        }
         this.tilesRenderer?.dispose();
         this.dracoLoader?.dispose();
         this.tilesRenderer = null;
